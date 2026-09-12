@@ -7,9 +7,10 @@ import sqlite3
 import uuid as uuid_lib
 from contextlib import closing
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 import aiohttp
-from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -355,7 +356,7 @@ async def health_check_loop():
 
 
 # ============================================================
-#  CLOUDFLARE API (اتصال کاملاً اتوماتیک تنها با توکن کاربر)
+#  CLOUDFLARE API
 # ============================================================
 async def get_cf_account_id(cf_token: str) -> str | None:
     headers = {"Authorization": f"Bearer {cf_token}"}
@@ -403,7 +404,7 @@ async def deploy_worker_auto(cf_token: str, user_uuid: str) -> tuple[str, str] |
 
 
 # ============================================================
-#  سیستم ساخت کانفیگ تخصصی (گیم، نت ملی، معمولی)
+#  سیستم ساخت کانفیگ تخصصی
 # ============================================================
 def build_configs_for_user(user_uuid: str, worker_host: str, profile_type: str = "normal") -> list[str]:
     configs = []
@@ -456,7 +457,7 @@ def build_sub_text(user_uuid: str, worker_host: str) -> str:
 
 
 # ============================================================
-#  MIDDLEWARE & PROJECT SOCIAL GATES (عضویت اجباری پروژه‌ای)
+#  MIDDLEWARE & PROJECT SOCIAL GATES
 # ============================================================
 def get_pending_project_socials(user_id: int):
     with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -759,7 +760,7 @@ async def support_user_send(message: types.Message, state: FSMContext):
 
 
 # ============================================================
-#  پنل مدیریت و بخش ثبت کانال یوتیوب و تلگرام پروژه
+#  پنل مدیریت
 # ============================================================
 @dp.callback_query(F.data == "admin_panel")
 async def admin_panel_cb(callback: types.CallbackQuery):
@@ -840,9 +841,6 @@ async def admin_support_list(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# ============================================================
-#  مدیریت ثبت کانال یوتیوب و کانال تلگرام پروژه برای عضویت اجباری
-# ============================================================
 @dp.callback_query(F.data == "admin_project_socials")
 async def admin_project_socials_cb(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -956,32 +954,47 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
 
 
 # ============================================================
-#  وب‌سرور ساب‌اسکریپت (اصلاح شده با وب‌هوک صحیح aiohttp.web.Request)
+#  وب‌سرور داخلی استاندارد (بدون وابستگی به aiohttp.web)
 # ============================================================
-async def sub_handler(request: web.Request):
-    req_uuid = request.match_info["user_uuid"]
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM users WHERE config_uuid=?", (req_uuid,)).fetchone()
-    if not row or not row["worker_host"]:
-        return web.Response(status=404, text="Config not found")
-    
-    sub_content = build_sub_text(req_uuid, row["worker_host"])
-    return web.Response(
-        text=sub_content,
-        content_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": "inline; filename=\"sub.txt\""}
-    )
+class SimpleSubHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        path_parts = parsed_path.path.strip("/").split("/")
+        
+        if len(path_parts) == 2 and path_parts[0] == "sub":
+            req_uuid = path_parts[1]
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute("SELECT * FROM users WHERE config_uuid=?", (req_uuid,)).fetchone()
+            
+            if row and row["worker_host"]:
+                sub_content = build_sub_text(req_uuid, row["worker_host"])
+                encoded_content = sub_content.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Disposition", 'inline; filename="sub.txt"')
+                self.send_header("Content-Length", str(len(encoded_content)))
+                self.end_headers()
+                self.wfile.write(encoded_content)
+                return
+
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Config not found")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_http_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), SimpleSubHandler)
+    server.serve_forever()
 
 
 async def run_web_app():
-    app = web.Application()
-    app.router.add_get("/sub/{user_uuid}", sub_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    await asyncio.to_thread(run_http_server)
 
 
 # ============================================================
@@ -989,7 +1002,7 @@ async def run_web_app():
 # ============================================================
 async def main():
     init_db()
-    await run_web_app()
+    asyncio.create_task(run_web_app())
     asyncio.create_task(health_check_loop())
     await dp.start_polling(bot)
 
