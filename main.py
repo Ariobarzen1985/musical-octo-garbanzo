@@ -145,7 +145,6 @@ def init_db():
                 created_at TEXT
             )
         """)
-        # جدول نگهداری لینک‌های پروژه (یوتیوب و تلگرام اختصاصی پروژه)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS project_socials (
                 platform TEXT PRIMARY KEY,
@@ -153,7 +152,6 @@ def init_db():
                 url TEXT
             )
         """)
-        # وضعیت تأیید عضویت کاربران در کانال‌های پروژه
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_project_checks (
                 user_id INTEGER,
@@ -654,7 +652,7 @@ async def process_cf_token(message: types.Message, state: FSMContext):
 
 
 # ============================================================
-#  ساخت کانفیگ‌های تخصصی و لینک ساب‌اسکریپت (رفع مشکل خالی بودن کلاینت‌ها)
+#  ساخت کانفیگ‌های تخصصی و لینک ساب‌اسکریپت
 # ============================================================
 @dp.callback_query(F.data == "config_builder_menu")
 async def config_builder_menu_cb(callback: types.CallbackQuery):
@@ -707,7 +705,7 @@ async def get_user_configs(callback: types.CallbackQuery):
 
     text = (
         f"📁 **لینک ساب‌اسکریپت اختصاصی شما**\n\n"
-        f"این لینک را کپی کرده و مستقیماً در **V2Box** یا **V2RayNG** وارد کنید (گزینه Subscribtion):\n\n"
+        f"این لینک را کپی کرده و مستقیماً در **V2Box** یا **V2RayNG** وارد کنید:\n\n"
         f"`{sub_link}`"
     )
     await callback.message.answer(text, reply_markup=main_menu_kb(callback.from_user.id), parse_mode="Markdown")
@@ -958,7 +956,7 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
 
 
 # ============================================================
-#  وب‌سرور ساب‌اسکریپت (بهینه‌سازی شده برای کلاینت‌های V2Box و V2RayNG)
+#  وب‌سرور ساب‌اسکریپت (اصلاح شده با وب‌هوک صحیح aiohttp.web.Request)
 # ============================================================
 async def sub_handler(request: web.Request):
     req_uuid = request.match_info["user_uuid"]
