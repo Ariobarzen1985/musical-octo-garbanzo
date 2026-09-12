@@ -9,6 +9,7 @@ from contextlib import closing
 from datetime import datetime
 
 import aiohttp
+from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -25,45 +26,49 @@ CF_API_BASE = "https://api.cloudflare.com/client/v4"
 WORKER_SCRIPT_NAME = "ariobarzan-master"
 WORKER_JS_PATH = "worker.js"
 
-# بارگذاری کد ورکر کلودفلر
 if os.path.exists(WORKER_JS_PATH):
     with open(WORKER_JS_PATH, "r", encoding="utf-8") as f:
         WORKER_JS_SOURCE = f.read()
 else:
-    WORKER_JS_SOURCE = """export default { async fetch(request, env) { return new Response('Active'); } }"""
+    WORKER_JS_SOURCE = """
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const upgradeHeader = request.headers.get("Upgrade");
+    if (upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
+      return await handleVlessWebSocket(request, env.UUID);
+    }
+    return new Response("Ariobarzan Proxy Active", { status: 200 });
+  }
+};
 
-# استخر ۱۵ عددی با ۳ تای اول هلند (پشتیبانی کامل از نت ملی)
+async function handleVlessWebSocket(request, userID) {
+  const webSocketPair = new WebSocketPair();
+  const [client, server] = Object.values(webSocketPair);
+  server.accept();
+  return new Response(null, {
+    status: 101,
+    webSocket: client,
+  });
+}
+"""
+
 COUNTRY_POOLS = {
     "Netherlands": {
         "flag": "🇳🇱",
         "seed": ["188.114.96.3", "188.114.97.3", "188.114.99.5"],
-        "reserve": ["188.114.96.4", "188.114.97.9", "188.114.98.6"]
+        "reserve": ["188.114.96.4", "188.114.97.9"]
     },
     "Germany": {
         "flag": "🇩🇪",
-        "seed": ["104.16.85.20", "104.16.86.20", "104.16.87.20"],
-        "reserve": ["104.16.88.20", "104.16.89.20"]
+        "seed": ["104.16.85.20", "104.16.86.20"],
+        "reserve": ["104.16.88.20"]
     },
     "United States": {
         "flag": "🇺🇸",
-        "seed": ["104.17.24.14", "104.18.20.10", "104.19.30.5"],
-        "reserve": ["104.17.25.14", "104.18.21.10"]
-    },
-    "France": {
-        "flag": "🇫🇷",
-        "seed": ["104.20.10.10", "104.21.10.10"],
-        "reserve": ["104.20.11.10"]
-    },
-    "United Kingdom": {
-        "flag": "🇬🇧",
-        "seed": ["172.64.100.5", "172.64.150.5"],
-        "reserve": ["172.64.101.5"]
-    },
-    "Canada": {
-        "flag": "🇨🇦",
-        "seed": ["104.24.10.10"],
-        "reserve": ["104.25.10.10"]
-    },
+        "seed": ["104.17.24.14", "104.18.20.10"],
+        "reserve": ["104.17.25.14"]
+    }
 }
 
 DB_PATH = "ariobarzan_pro.db"
@@ -84,19 +89,19 @@ class SetupStates(StatesGroup):
 class BroadcastStates(StatesGroup):
     waiting_for_message = State()
 
-class ChannelStates(StatesGroup):
-    waiting_for_channel = State()
+class ProjectSocialStates(StatesGroup):
+    waiting_for_youtube = State()
+    waiting_for_telegram = State()
 
 class AdminManageStates(StatesGroup):
     waiting_for_admin_id = State()
 
 class SupportStates(StatesGroup):
     waiting_for_user_msg = State()
-    waiting_for_admin_reply = State()
 
 
 # ============================================================
-#  DATABASE INIT & METHODS (ضد کرش و بهینه)
+#  DATABASE INIT & METHODS
 # ============================================================
 def init_db():
     with closing(sqlite3.connect(DB_PATH)) as conn:
@@ -108,8 +113,6 @@ def init_db():
                 cf_account_id TEXT,
                 config_uuid TEXT,
                 worker_host TEXT,
-                traffic_limit INTEGER DEFAULT 0,
-                expire_date TEXT,
                 created_at TEXT
             )
         """)
@@ -142,6 +145,23 @@ def init_db():
                 created_at TEXT
             )
         """)
+        # جدول نگهداری لینک‌های پروژه (یوتیوب و تلگرام اختصاصی پروژه)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS project_socials (
+                platform TEXT PRIMARY KEY,
+                title TEXT,
+                url TEXT
+            )
+        """)
+        # وضعیت تأیید عضویت کاربران در کانال‌های پروژه
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_project_checks (
+                user_id INTEGER,
+                platform TEXT,
+                verified INTEGER DEFAULT 0,
+                PRIMARY KEY(user_id, platform)
+            )
+        """)
         conn.commit()
 
     for aid in INITIAL_ADMINS:
@@ -154,10 +174,6 @@ def init_db():
 
     if get_setting("bot_enabled") is None:
         set_setting("bot_enabled", "1")
-    if get_setting("forced_join_enabled") is None:
-        set_setting("forced_join_enabled", "0")
-    if get_setting("forced_channels") is None:
-        set_setting("forced_channels", "[]")
 
 
 def get_user(user_id: int):
@@ -178,13 +194,13 @@ def upsert_user(user_id: int, **fields):
                 for key, value in fields.items():
                     conn.execute(f"UPDATE users SET {key}=? WHERE user_id=?", (value, user_id))
             else:
-                for key in ("config_uuid", "worker_host", "cf_token", "cf_account_id", "username", "traffic_limit", "expire_date"):
+                for key in ("config_uuid", "worker_host", "cf_token", "cf_account_id", "username"):
                     fields.setdefault(key, None)
                 conn.execute(
-                    "INSERT INTO users (user_id, username, cf_token, cf_account_id, config_uuid, worker_host, traffic_limit, expire_date, created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO users (user_id, username, cf_token, cf_account_id, config_uuid, worker_host, created_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
                     (user_id, fields["username"], fields["cf_token"], fields["cf_account_id"],
-                     fields["config_uuid"], fields["worker_host"], fields["traffic_limit"], fields["expire_date"], datetime.utcnow().isoformat()),
+                     fields["config_uuid"], fields["worker_host"], datetime.utcnow().isoformat()),
                 )
             conn.commit()
     except Exception as e:
@@ -291,7 +307,7 @@ def get_active_pool_grouped():
 
 
 # ============================================================
-#  سلامت‌سنجی هوشمند IP (تضمین پایداری در نت ملی)
+#  سلامت‌سنجی هوشمند IP
 # ============================================================
 async def tcp_alive(ip: str, port: int = 443, timeout: float = HEALTH_CHECK_TIMEOUT) -> bool:
     try:
@@ -341,7 +357,7 @@ async def health_check_loop():
 
 
 # ============================================================
-#  CLOUDFLARE API (اتصال مستقیم فقط با توکن کاربر)
+#  CLOUDFLARE API (اتصال کاملاً اتوماتیک تنها با توکن کاربر)
 # ============================================================
 async def get_cf_account_id(cf_token: str) -> str | None:
     headers = {"Authorization": f"Bearer {cf_token}"}
@@ -389,15 +405,12 @@ async def deploy_worker_auto(cf_token: str, user_uuid: str) -> tuple[str, str] |
 
 
 # ============================================================
-#  ساخت ۱۵ کانفیگ (۳ تای اول هلند + تگ‌های سفارشی)
+#  سیستم ساخت کانفیگ تخصصی (گیم، نت ملی، معمولی)
 # ============================================================
-def build_configs_for_user(user_uuid: str, worker_host: str) -> list[str]:
+def build_configs_for_user(user_uuid: str, worker_host: str, profile_type: str = "normal") -> list[str]:
     configs = []
     pool = get_active_pool_grouped()
-    
-    # اولویت دادن به هلند در صدر لیست (۳ کانفیگ اول)
     ordered_countries = ["Netherlands"] + [c for c in pool.keys() if c != "Netherlands"]
-    
     counter = 1
     total_built = 0
     
@@ -409,20 +422,21 @@ def build_configs_for_user(user_uuid: str, worker_host: str) -> list[str]:
             if total_built >= 15:
                 break
             
-            # برچسب‌گذاری ۳ مورد خاص در بین کانفیگ‌ها
-            if total_built == 0:
-                name = "Ariobarzen 🇳🇱 NL-Traffic [حجم: نامحدود]"
-            elif total_built == 1:
-                name = "Ariobarzen 🇳🇱 NL-Free-Promo [@Aryobarzen_Bot]"
-            elif total_built == 2:
-                name = "Ariobarzen 🇳🇱 NL-Warning [رایگان و غیرقابل فروش ❌]"
+            if profile_type == "gaming":
+                path_val = "%2Fgaming"
+                name_prefix = "🎮 Gaming [Low-Ping]"
+            elif profile_type == "national":
+                path_val = "%2Fnational"
+                name_prefix = "🛡 National [Anti-Block]"
             else:
-                name = f"Ariobarzen {info['flag']} {country}-{counter}"
+                path_val = "%2F"
+                name_prefix = "⚡ Normal"
 
+            name = f"Ariobarzen {info['flag']} {name_prefix} - {counter}"
             link = (
                 f"vless://{user_uuid}@{ip}:443"
                 f"?encryption=none&security=tls&sni={worker_host}&host={worker_host}"
-                f"&type=ws&path=%2F#{name}"
+                f"&type=ws&path={path_val}#{name}"
             )
             configs.append(link)
             counter += 1
@@ -434,28 +448,37 @@ def build_configs_for_user(user_uuid: str, worker_host: str) -> list[str]:
 
 
 def build_sub_text(user_uuid: str, worker_host: str) -> str:
-    raw = "\n".join(build_configs_for_user(user_uuid, worker_host))
+    raw_list = (
+        build_configs_for_user(user_uuid, worker_host, "normal") +
+        build_configs_for_user(user_uuid, worker_host, "gaming") +
+        build_configs_for_user(user_uuid, worker_host, "national")
+    )
+    raw = "\n".join(raw_list[:15])
     return base64.b64encode(raw.encode("utf-8")).decode("utf-8")
 
 
 # ============================================================
-#  MIDDLEWARE & GUARDS (عضویت اجباری و کنترل دسترسی)
+#  MIDDLEWARE & PROJECT SOCIAL GATES (عضویت اجباری پروژه‌ای)
 # ============================================================
-async def is_member_of_all(user_id: int, channels: list[str]) -> bool:
-    for ch in channels:
-        try:
-            member = await bot.get_chat_member(ch, user_id)
-            if member.status in ("left", "kicked"):
-                return False
-        except Exception:
-            return False
-    return True
+def get_pending_project_socials(user_id: int):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        socials = conn.execute("SELECT * FROM project_socials").fetchall()
+        pending = []
+        for s in socials:
+            v = conn.execute("SELECT verified FROM user_project_checks WHERE user_id=? AND platform=?", (user_id, s["platform"])).fetchone()
+            if not v or not v[0]:
+                pending.append(dict(s))
+        return pending
 
 
-def join_required_kb(channels: list[str]) -> types.InlineKeyboardMarkup:
-    rows = [[types.InlineKeyboardButton(text=f"📢 عضویت در {c}", url=f"https://t.me/{c.lstrip('@')}")]
-            for c in channels]
-    rows.append([types.InlineKeyboardButton(text="✅ عضو شدم، بررسی کن", callback_data="check_membership")])
+def project_join_required_kb(social_items: list[dict]) -> types.InlineKeyboardMarkup:
+    rows = []
+    for s in social_items:
+        icon = "📺" if s["platform"] == "youtube" else "📢"
+        rows.append([types.InlineKeyboardButton(text=f"{icon} عضویت در {s['title']}", url=s["url"])])
+        rows.append([types.InlineKeyboardButton(text=f"✅ تأیید عضویت: {s['title']}", callback_data=f"verify_proj_social:{s['platform']}")])
+    rows.append([types.InlineKeyboardButton(text="🔄 بررسی نهایی عضویت‌ها", callback_data="check_proj_membership")])
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -474,18 +497,19 @@ class AccessMiddleware(BaseMiddleware):
                     await event.answer(text)
                 return
 
-            if get_setting("forced_join_enabled", "0") == "1":
-                channels = json.loads(get_setting("forced_channels", "[]"))
-                cb_data = getattr(event, "data", None)
-                if channels and cb_data != "check_membership":
-                    if not await is_member_of_all(user.id, channels):
-                        text = "⚠️ برای استفاده از ربات ابتدا در کانال‌های زیر عضو شوید:"
-                        if isinstance(event, types.CallbackQuery):
-                            await event.message.answer(text, reply_markup=join_required_kb(channels))
-                            await event.answer()
-                        else:
-                            await event.answer(text, reply_markup=join_required_kb(channels))
-                        return
+            pending_socials = get_pending_project_socials(user.id)
+            cb_data = getattr(event, "data", None)
+            is_verification = cb_data == "check_proj_membership" or (cb_data and cb_data.startswith("verify_proj_social:"))
+
+            if not is_verification and pending_socials:
+                text = "⚠️ برای استفاده از ربات لطفا در کانال‌های رسمی پروژه زیر عضو شوید:"
+                keyboard = project_join_required_kb(pending_socials)
+                if isinstance(event, types.CallbackQuery):
+                    await event.message.answer(text, reply_markup=keyboard)
+                    await event.answer()
+                else:
+                    await event.answer(text, reply_markup=keyboard)
+                return
         except Exception:
             pass
 
@@ -496,21 +520,33 @@ dp.message.outer_middleware(AccessMiddleware())
 dp.callback_query.outer_middleware(AccessMiddleware())
 
 
-@dp.callback_query(F.data == "check_membership")
-async def check_membership_cb(callback: types.CallbackQuery):
-    channels = json.loads(get_setting("forced_channels", "[]"))
-    if await is_member_of_all(callback.from_user.id, channels):
-        await callback.message.answer("✅ عضویت تأیید شد.", reply_markup=main_menu_kb(callback.from_user.id))
+@dp.callback_query(F.data.startswith("verify_proj_social:"))
+async def verify_proj_social_cb(callback: types.CallbackQuery):
+    platform = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("INSERT OR REPLACE INTO user_project_checks (user_id, platform, verified) VALUES (?,?,1)", (user_id, platform))
+        conn.commit()
+    await callback.answer("✅ تأیید شد! لطفاً دکمه بررسی نهایی را بزنید.", show_alert=True)
+
+
+@dp.callback_query(F.data == "check_proj_membership")
+async def check_proj_membership_cb(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    pending_socials = get_pending_project_socials(user_id)
+    if not pending_socials:
+        await callback.message.answer("✅ عضویت شما تأیید شد.", reply_markup=main_menu_kb(user_id))
     else:
-        await callback.answer("هنوز عضو همه‌ی کانال‌ها نشده‌اید.", show_alert=True)
+        await callback.answer("هنوز در تمام کانال‌های پروژه عضو نشده‌اید یا تأیید نکرده‌اید.", show_alert=True)
 
 
 # ============================================================
-#  کیبوردها (دکمه بازگشت همه جا + استارت مجدد)
+#  کیبوردها
 # ============================================================
 def main_menu_kb(user_id: int) -> types.InlineKeyboardMarkup:
     rows = [
         [types.InlineKeyboardButton(text="⚡ اتصال خودکار با توکن کلودفلر", callback_data="connect_cf")],
+        [types.InlineKeyboardButton(text="🛠 ساخت کانفیگ تخصصی (گیم، نت ملی)", callback_data="config_builder_menu")],
         [types.InlineKeyboardButton(text="📁 دریافت لینک ساب‌اسکریپت", callback_data="get_configs")],
         [types.InlineKeyboardButton(text="🔑 دریافت کانفیگ تکی", callback_data="get_single_config")],
         [types.InlineKeyboardButton(text="📖 راهنمای جامع استفاده", callback_data="user_guide")],
@@ -530,14 +566,13 @@ def back_to_main_kb() -> types.InlineKeyboardMarkup:
 
 def admin_panel_kb() -> types.InlineKeyboardMarkup:
     bot_on = get_setting("bot_enabled", "1") == "1"
-    forced_on = get_setting("forced_join_enabled", "0") == "1"
     return types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text=("🔴 خاموش کردن ربات" if bot_on else "🟢 روشن کردن ربات"), callback_data="toggle_bot")],
-        [types.InlineKeyboardButton(text=f"📢 عضویت اجباری ({'فعال' if forced_on else 'غیرفعال'})", callback_data="forced_join_menu")],
+        [types.InlineKeyboardButton(text="📺 ثبت کانال یوتیوب و تلگرام پروژه", callback_data="admin_project_socials")],
         [types.InlineKeyboardButton(text="👥 مدیریت کاربران", callback_data="admin_users_list")],
-        [types.InlineKeyboardButton(text="📊 آمار کلی و پایداری نت ملی", callback_data="admin_stats")],
+        [types.InlineKeyboardButton(text="📊 آمار کلی سیستم", callback_data="admin_stats")],
         [types.InlineKeyboardButton(text="👑 مدیریت ادمین‌ها", callback_data="admin_manage_admins")],
-        [types.InlineKeyboardButton(text="📨 صندوق پیام‌های پشتیبانی", callback_data="admin_support_list")],
+        [types.InlineKeyboardButton(text="📨 پیام‌های پشتیبانی", callback_data="admin_support_list")],
         [types.InlineKeyboardButton(text="📢 ارسال پیام همگانی", callback_data="admin_broadcast")],
         [types.InlineKeyboardButton(text="◀️ بازگشت به منوی اصلی", callback_data="back_main")],
     ])
@@ -551,8 +586,7 @@ async def send_welcome(message: types.Message):
     upsert_user(message.from_user.id, username=message.from_user.username)
     await message.answer(
         "🚀 **به ربات پیشرفته آریوبرزن خوش آمدید**\n\n"
-        "این ربات به صورت کاملاً اختصاصی و مستقیم از طریق **توکن کلودفلر** شما، کانفیگ‌های پرسرعت می‌سازد.\n\n"
-        " تمامی کانفیگ‌ها در **نت ملی** کاملاً متصل و پایدار هستند.",
+        "این ربات به صورت کاملاً اتوماتیک با توکن کلودفلر شما متصل شده و کانفیگ‌های پرسرعت می‌سازد.",
         reply_markup=main_menu_kb(message.from_user.id),
         parse_mode="Markdown"
     )
@@ -574,16 +608,9 @@ async def back_main_cb(callback: types.CallbackQuery):
 async def user_guide_cb(callback: types.CallbackQuery):
     guide_text = (
         "📖 **راهنمای جامع استفاده از ربات آریوبرزن**\n\n"
-        "۱. **نحوه اتصال به کلودفلر:**\n"
-        "با زدن روی دکمه «اتصال خودکار با توکن کلودفلر»، کافی است توکن API اکانت خود را بفرستید. ربات بدون هیچ سوال اضافی، ورکر اختصاصی شما را روی هاست ابری رایگان خودتان مستقر می‌کند.\n\n"
-        "۲. **دریافت و استفاده از کانفیگ‌ها:**\n"
-        "پس از اتصال موفق، می‌توانید از بخش «دریافت لینک ساب‌اسکریپت» لینک مخصوص خود را بگیرید و آن را در برنامه‌های V2Ray (مثل v2rayNG، NekoBox و...) وارد کنید. همچنین امکان دریافت کانفیگ تکی وجود دارد.\n\n"
-        "۳. **ویژگی‌های کانفیگ‌ها:**\n"
-        "• شامل ۱۵ کانفیگ پرسرعت از لوکیشن‌های مختلف (با اولویت ۳ آی‌پی اختصاصی هلند در صدر لیست)\n"
-        "• مجهز به برچسب‌های اطلاعاتی حجم، لینک کانال و هشدار عدم فروش\n\n"
-        "🌐 **نکته بسیار مهم:** تمامی کانفیگ‌های این ربات بر بستر کلودفلر و سازگار با **نت ملی** طراحی شده‌اند و در هر شرایطی متصل می‌مانند.\n\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "✨ **ساخته شده توسط تیم آریوبرزن**"
+        "۱. توکن کلودفلر خود را از بخش «اتصال خودکار با توکن کلودفلر» ارسال کنید.\n"
+        "۲. لینک ساب‌اسکریپت خود را در V2Box، V2RayNG یا سایر کلاینت‌ها وارد کنید.\n"
+        "۳. از کانفیگ‌های اختصاصی گیم، نت ملی و معمولی لذت ببرید."
     )
     await callback.message.answer(guide_text, reply_markup=back_to_main_kb(), parse_mode="Markdown")
     await callback.answer()
@@ -592,9 +619,8 @@ async def user_guide_cb(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "connect_cf")
 async def ask_cf_token(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(
-        "🔑 **اتصال مستقیم به کلودفلر**\n\n"
-        "لطفاً **فقط و فقط توکن API کلودفلر** خود را بفرستید تا ربات ورکر اختصاصی شما را روی سرور ابری رایگان کلودفلر مستقر کند.\n\n"
-        "*(دسترسی لازم توکن: Workers Scripts:Edit)*",
+        "🔑 **اتصال اتوماتیک به کلودفلر**\n\n"
+        "لطفاً فقط توکن API کلودفلر خود را بفرستید (ربات به طور خودکار بقیه مراحل ساخت ورکر را انجام می‌دهد):",
         reply_markup=back_to_main_kb(),
         parse_mode="Markdown"
     )
@@ -608,16 +634,12 @@ async def process_cf_token(message: types.Message, state: FSMContext):
     await state.clear()
 
     status_msg = await message.answer("⏳ در حال برقراری ارتباط با کلودفلر و راه‌اندازی ورکر اختصاصی...")
-    
     user = get_user(message.from_user.id)
     user_uuid = (user or {}).get("config_uuid") or str(uuid_lib.uuid4())
 
     res = await deploy_worker_auto(cf_token, user_uuid)
     if not res:
-        await status_msg.edit_text(
-            "❌ اتصال ناموفق بود. توکن نامعتبر است یا دسترسی Workers Scripts:Edit را ندارد.",
-            reply_markup=main_menu_kb(message.from_user.id)
-        )
+        await status_msg.edit_text("❌ اتصال ناموفق بود. توکن نامعتبر است یا دسترسی‌های لازم را ندارد.", reply_markup=main_menu_kb(message.from_user.id))
         return
 
     worker_host, account_id = res
@@ -625,12 +647,52 @@ async def process_cf_token(message: types.Message, state: FSMContext):
                 config_uuid=user_uuid, worker_host=worker_host)
 
     await status_msg.edit_text(
-        f"🎉 **اتصال موفقیت‌آمیز بود!**\n\n"
-        f"هاست اختصاصی شما روی کلودفلر:\n`{worker_host}`\n\n"
-        "هم‌اکنون کانفیگ‌های شما آماده است.",
+        f"🎉 **اتصال و راه‌اندازی با موفقیت انجام شد!**\n\nهاست اختصاصی شما:\n`{worker_host}`",
         reply_markup=main_menu_kb(message.from_user.id),
         parse_mode="Markdown"
     )
+
+
+# ============================================================
+#  ساخت کانفیگ‌های تخصصی و لینک ساب‌اسکریپت (رفع مشکل خالی بودن کلاینت‌ها)
+# ============================================================
+@dp.callback_query(F.data == "config_builder_menu")
+async def config_builder_menu_cb(callback: types.CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if not user or not user.get("worker_host"):
+        await callback.answer("⚠️ ابتدا باید اکانت کلودفلر خود را وصل کنید.", show_alert=True)
+        return
+
+    rows = [
+        [types.InlineKeyboardButton(text="🎮 ساخت کانفیگ مخصوص گیم (Low-Ping)", callback_data="make_cfg:gaming")],
+        [types.InlineKeyboardButton(text="🛡 ساخت کانفیگ نت ملی (Anti-Block)", callback_data="make_cfg:national")],
+        [types.InlineKeyboardButton(text="⚡ ساخت کانفیگ معمولی (High-Speed)", callback_data="make_cfg:normal")],
+        [types.InlineKeyboardButton(text="◀️ بازگشت به منوی اصلی", callback_data="back_main")]
+    ]
+    await callback.message.edit_text(
+        "🛠 **بخش ساخت کانفیگ‌های تخصصی**\n\nپروفایل مورد نظر خود را انتخاب کنید:",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("make_cfg:"))
+async def make_custom_config_cb(callback: types.CallbackQuery):
+    profile = callback.data.split(":", 1)[1]
+    user = get_user(callback.from_user.id)
+    if not user or not user.get("worker_host"):
+        await callback.answer("⚠️ ابتدا اکانت خود را متصل کنید.", show_alert=True)
+        return
+
+    configs = build_configs_for_user(user["config_uuid"], user["worker_host"], profile)
+    text = (
+        f"✅ **کانفیگ‌های پروفایل ({profile.upper}) آماده شد!**\n\n"
+        f"نمونه کانفیگ:\n`{configs[0]}`\n\n"
+        f"برای دریافت لیست کامل ۱۵ عددی کلاینت، از دکمه «دریافت لینک ساب‌اسکریپت» استفاده کنید."
+    )
+    await callback.message.answer(text, reply_markup=main_menu_kb(callback.from_user.id), parse_mode="Markdown")
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "get_configs")
@@ -645,10 +707,8 @@ async def get_user_configs(callback: types.CallbackQuery):
 
     text = (
         f"📁 **لینک ساب‌اسکریپت اختصاصی شما**\n\n"
-        f"این لینک شامل ۱۵ کانفیگ پرسرعت (با اولویت هلند و اتصال تضمینی در **نت ملی**) است:\n\n"
-        f"`{sub_link}`\n\n"
-        f"📢 سازنده: @Aryobarzen_Bot\n"
-        f"⚠️ تمامی کانفیگ‌ها رایگان و غیرقابل فروش هستند."
+        f"این لینک را کپی کرده و مستقیماً در **V2Box** یا **V2RayNG** وارد کنید (گزینه Subscribtion):\n\n"
+        f"`{sub_link}`"
     )
     await callback.message.answer(text, reply_markup=main_menu_kb(callback.from_user.id), parse_mode="Markdown")
     await callback.answer()
@@ -661,13 +721,9 @@ async def get_single_config(callback: types.CallbackQuery):
         await callback.answer("⚠️ ابتدا اکانت خود را وصل کنید.", show_alert=True)
         return
 
-    configs = build_configs_for_user(user["config_uuid"], user["worker_host"])
-    if not configs:
-        await callback.answer("❌ در حال حاضر کانفیگی موجود نیست.", show_alert=True)
-        return
-
+    configs = build_configs_for_user(user["config_uuid"], user["worker_host"], "normal")
     await callback.message.answer(
-        f"🔑 **نمونه کانفیگ تکی پرسرعت (هلند - نت ملی):**\n\n`{configs[0]}`\n\n📢 @Aryobarzen_Bot",
+        f"🔑 **نمونه کانفیگ تکی پرسرعت:**\n\n`{configs[0]}`",
         reply_markup=main_menu_kb(callback.from_user.id),
         parse_mode="Markdown"
     )
@@ -679,10 +735,7 @@ async def get_single_config(callback: types.CallbackQuery):
 # ============================================================
 @dp.callback_query(F.data == "support_user")
 async def support_user_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer(
-        "💬 پیام خود را برای پشتیبانی ارسال کنید:",
-        reply_markup=back_to_main_kb()
-    )
+    await callback.message.answer("💬 پیام خود را برای پشتیبانی ارسال کنید:", reply_markup=back_to_main_kb())
     await state.set_state(SupportStates.waiting_for_user_msg)
     await callback.answer()
 
@@ -700,26 +753,21 @@ async def support_user_send(message: types.Message, state: FSMContext):
         ticket_id = cursor.lastrowid
 
     await message.answer("✅ پیام شما به پشتیبانی ارسال شد.", reply_markup=main_menu_kb(message.from_user.id))
-    
     for aid in INITIAL_ADMINS:
         try:
-            await bot.send_message(
-                aid,
-                f"📨 **پیام جدید پشتیبانی** (تیکت #{ticket_id})\nاز طرف: `{message.from_user.id}`\n\n{text}",
-                parse_mode="Markdown"
-            )
+            await bot.send_message(aid, f"📨 **تیکت پشتیبانی #{ticket_id}** از کاربر `{message.from_user.id}`:\n\n{text}", parse_mode="Markdown")
         except Exception:
             pass
 
 
 # ============================================================
-#  پنل ادمین غول
+#  پنل مدیریت و بخش ثبت کانال یوتیوب و تلگرام پروژه
 # ============================================================
 @dp.callback_query(F.data == "admin_panel")
 async def admin_panel_cb(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return await callback.answer("⛔️ دسترسی غیرمجاز.", show_alert=True)
-    await callback.message.edit_text("🛠 **پنل مدیریت غول آریوبرزن**", reply_markup=admin_panel_kb(), parse_mode="Markdown")
+    await callback.message.edit_text("🛠 **پنل مدیریت آریوبرزن**", reply_markup=admin_panel_kb(), parse_mode="Markdown")
     await callback.answer()
 
 
@@ -729,7 +777,7 @@ async def toggle_bot_cb(callback: types.CallbackQuery):
         return
     current = get_setting("bot_enabled", "1")
     set_setting("bot_enabled", "0" if current == "1" else "1")
-    await callback.message.edit_text("🛠 **پنل مدیریت غول**", reply_markup=admin_panel_kb(), parse_mode="Markdown")
+    await callback.message.edit_text("🛠 **پنل مدیریت آریوبرزن**", reply_markup=admin_panel_kb(), parse_mode="Markdown")
     await callback.answer("وضعیت ربات تغییر کرد.")
 
 
@@ -738,17 +786,8 @@ async def admin_stats_cb(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     users = all_users()
-    total = len(users)
     active_workers = sum(1 for u in users if u.get("worker_host"))
-    ip_rows = get_all_ip_rows()
-    alive_ips = sum(1 for r in ip_rows if r["alive"])
-    
-    text = (
-        f"📊 **آمار جامع سیستم و پایداری نت ملی**\n\n"
-        f"👥 کل کاربران: {total}\n"
-        f"⚡ وورکر فعال کلودفلر: {active_workers}\n"
-        f"🌐 آی‌پی‌های سالم در استخر (نت ملی): {alive_ips} از {len(ip_rows)}"
-    )
+    text = f"📊 **آمار سیستم**\n\n👥 کل کاربران: {len(users)}\n⚡ ورکر فعال: {active_workers}"
     await callback.message.answer(text, reply_markup=back_to_main_kb(), parse_mode="Markdown")
     await callback.answer()
 
@@ -758,8 +797,8 @@ async def admin_users_list(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     users = all_users()
-    lines = [f"• `{u['user_id']}` (@{u['username'] or '—'})" for u in users[:25]]
-    text = "👥 **لیست کاربران اخیر:**\n\n" + ("\n".join(lines) if lines else "کاربری ثبت نشده.")
+    lines = [f"• `{u['user_id']}` (@{u['username'] or '—'})" for u in users[:20]]
+    text = "👥 **لیست کاربران:**\n\n" + ("\n".join(lines) if lines else "کاربری ثبت نشده.")
     await callback.message.answer(text, reply_markup=back_to_main_kb(), parse_mode="Markdown")
     await callback.answer()
 
@@ -779,7 +818,7 @@ async def admin_add_save(message: types.Message, state: FSMContext):
         new_aid = int(message.text.strip())
         add_admin_db(new_aid)
         await state.clear()
-        await message.answer("✅ ادمین جدید اضافه شد.", reply_markup=main_menu_kb(message.from_user.id))
+        await message.answer("✅ ادمین جدید افزوده شد.", reply_markup=main_menu_kb(message.from_user.id))
     except Exception:
         await message.answer("❌ آیدی نامعتبر است.")
 
@@ -796,69 +835,100 @@ async def admin_support_list(callback: types.CallbackQuery):
         await callback.answer("تیکت بازی وجود ندارد.", show_alert=True)
         return
 
-    text = "📨 **تیکت‌های باز پشتیبانی:**\n\n"
+    text = "📨 **تیکت‌های باز:**\n\n"
     for t in tickets:
-        text += f"شناسه تیکت: #{t['ticket_id']} | کاربر: `{t['user_id']}`\nمتن: {t['message']}\n---\n"
+        text += f"#{t['ticket_id']} | کاربر: `{t['user_id']}`\nمتن: {t['message']}\n---\n"
     await callback.message.answer(text, reply_markup=back_to_main_kb(), parse_mode="Markdown")
     await callback.answer()
 
 
-@dp.callback_query(F.data == "forced_join_menu")
-async def forced_join_menu_cb(callback: types.CallbackQuery):
+# ============================================================
+#  مدیریت ثبت کانال یوتیوب و کانال تلگرام پروژه برای عضویت اجباری
+# ============================================================
+@dp.callback_query(F.data == "admin_project_socials")
+async def admin_project_socials_cb(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    forced_on = get_setting("forced_join_enabled", "0") == "1"
-    channels = json.loads(get_setting("forced_channels", "[]"))
-    rows = [[types.InlineKeyboardButton(text=("🔴 غیرفعال کردن عضویت" if forced_on else "🟢 فعال کردن عضویت"), callback_data="toggle_forced_join")]]
-    for ch in channels:
-        rows.append([types.InlineKeyboardButton(text=f"❌ حذف {ch}", callback_data=f"remove_ch:{ch}")])
-    rows.append([types.InlineKeyboardButton(text="➕ افزودن کانال/گروه", callback_data="add_channel_start")])
-    rows.append([types.InlineKeyboardButton(text="◀️ بازگشت به پنل", callback_data="admin_panel")])
-    
-    await callback.message.edit_text("📢 **مدیریت عضویت اجباری**", reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="Markdown")
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        socials = {r["platform"]: r for r in conn.execute("SELECT * FROM project_socials").fetchall()}
+
+    yt = socials.get("youtube")
+    tg = socials.get("telegram")
+
+    text = (
+        "📺 **ثبت کردن کانال یوتیوب و کانال تلگرام پروژه**\n\n"
+        f"• کانال یوتیوب فعلی: {yt['title'] if yt else 'ثبت نشده'} (`{yt['url'] if yt else '—'}`)\n"
+        f"• کانال تلگرام فعلی: {tg['title'] if tg else 'ثبت نشده'} (`{tg['url'] if tg else '—'}`)\n\n"
+        "یکی از گزینه‌های زیر را برای ثبت یا تغییر انتخاب کنید:"
+    )
+    rows = [
+        [types.InlineKeyboardButton(text="📺 ثبت/ویرایش کانال یوتیوب پروژه", callback_data="set_proj_yt")],
+        [types.InlineKeyboardButton(text="📢 ثبت/ویرایش کانال تلگرام پروژه", callback_data="set_proj_tg")],
+        [types.InlineKeyboardButton(text="◀️ بازگشت به پنل مدیریت", callback_data="admin_panel")]
+    ]
+    await callback.message.edit_text(text, reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="Markdown")
     await callback.answer()
 
 
-@dp.callback_query(F.data == "toggle_forced_join")
-async def toggle_forced_join_cb(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "set_proj_yt")
+async def set_proj_yt_cb(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    current = get_setting("forced_join_enabled", "0")
-    set_setting("forced_join_enabled", "0" if current == "1" else "1")
-    await forced_join_menu_cb(callback)
-
-
-@dp.callback_query(F.data == "add_channel_start")
-async def add_channel_start_cb(callback: types.CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await callback.message.answer("یوزرنیم کانال یا گروه را با @ بفرستید:")
-    await state.set_state(ChannelStates.waiting_for_channel)
+    await callback.message.answer(
+        "ارسال اطلاعات کانال یوتیوب پروژه:\n\n"
+        "لطفاً عنوان و لینک را با فرمت زیر بفرستید:\n`عنوان | لینک`\nمثال:\n`کانال یوتیوب آریوبرزن | https://youtube.com/@Saman_Night_Fear`",
+        reply_markup=back_to_main_kb(),
+        parse_mode="Markdown"
+    )
+    await state.set_state(ProjectSocialStates.waiting_for_youtube)
     await callback.answer()
 
 
-@dp.message(ChannelStates.waiting_for_channel)
-async def add_channel_save(message: types.Message, state: FSMContext):
+@dp.message(ProjectSocialStates.waiting_for_youtube)
+async def save_proj_yt(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    ch = message.text.strip()
-    channels = json.loads(get_setting("forced_channels", "[]"))
-    if ch not in channels:
-        channels.append(ch)
-        set_setting("forced_channels", json.dumps(channels))
+    parts = message.text.split("|")
+    if len(parts) < 2:
+        await message.answer("❌ فرمت نامعتبر است. از کاراکتر `|` استفاده کنید.")
+        return
+    title, url = parts[0].strip(), parts[1].strip()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("INSERT OR REPLACE INTO project_socials (platform, title, url) VALUES ('youtube', ?, ?)", (title, url))
+        conn.commit()
     await state.clear()
-    await message.answer("✅ کانال افزوده شد.", reply_markup=main_menu_kb(message.from_user.id))
+    await message.answer("✅ کانال یوتیوب پروژه با موفقیت ثبت شد و به بخش عضویت اجباری اضافه گردید.", reply_markup=main_menu_kb(message.from_user.id))
 
 
-@dp.callback_query(F.data.startswith("remove_ch:"))
-async def remove_channel_cb(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "set_proj_tg")
+async def set_proj_tg_cb(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    ch = callback.data.split(":", 1)[1]
-    channels = json.loads(get_setting("forced_channels", "[]"))
-    channels = [c for c in channels if c != ch]
-    set_setting("forced_channels", json.dumps(channels))
-    await forced_join_menu_cb(callback)
+    await callback.message.answer(
+        "ارسال اطلاعات کانال تلگرام پروژه:\n\n"
+        "لطفاً عنوان و لینک را با فرمت زیر بفرستید:\n`عنوان | لینک`\nمثال:\n`کانال تلگرام پروژه | https://t.me/YourChannel`",
+        reply_markup=back_to_main_kb(),
+        parse_mode="Markdown"
+    )
+    await state.set_state(ProjectSocialStates.waiting_for_telegram)
+    await callback.answer()
+
+
+@dp.message(ProjectSocialStates.waiting_for_telegram)
+async def save_proj_tg(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split("|")
+    if len(parts) < 2:
+        await message.answer("❌ فرمت نامعتبر است. از کاراکتر `|` استفاده کنید.")
+        return
+    title, url = parts[0].strip(), parts[1].strip()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("INSERT OR REPLACE INTO project_socials (platform, title, url) VALUES ('telegram', ?, ?)", (title, url))
+        conn.commit()
+    await state.clear()
+    await message.answer("✅ کانال تلگرام پروژه با موفقیت ثبت شد و به بخش عضویت اجباری اضافه گردید.", reply_markup=main_menu_kb(message.from_user.id))
 
 
 @dp.callback_query(F.data == "admin_broadcast")
@@ -888,26 +958,31 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
 
 
 # ============================================================
-#  وب‌سرور ساب‌اسکریپت
+#  وب‌سرور ساب‌اسکریپت (بهینه‌سازی شده برای کلاینت‌های V2Box و V2RayNG)
 # ============================================================
-async def sub_handler(request: aiohttp.web.Request):
+async def sub_handler(request: web.Request):
     req_uuid = request.match_info["user_uuid"]
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM users WHERE config_uuid=?", (req_uuid,)).fetchone()
     if not row or not row["worker_host"]:
-        return aiohttp.web.Response(status=404, text="Config not found")
-    body = build_sub_text(req_uuid, row["worker_host"])
-    return aiohttp.web.Response(text=body, content_type="text/plain")
+        return web.Response(status=404, text="Config not found")
+    
+    sub_content = build_sub_text(req_uuid, row["worker_host"])
+    return web.Response(
+        text=sub_content,
+        content_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": "inline; filename=\"sub.txt\""}
+    )
 
 
 async def run_web_app():
-    app = aiohttp.web.Application()
+    app = web.Application()
     app.router.add_get("/sub/{user_uuid}", sub_handler)
-    runner = aiohttp.web.AppRunner(app)
+    runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", 8080))
-    site = aiohttp.web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
 
