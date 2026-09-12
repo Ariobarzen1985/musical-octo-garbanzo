@@ -1,140 +1,148 @@
 import { connect } from 'cloudflare:sockets';
 
-const UuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
 export default {
-    async fetch(request, env, ctx) {
-        try {
-            const upgradeHeader = request.headers.get('Upgrade');
-            if (!upgradeHeader || upgradeHeader !== 'websocket') {
-                return new Response('Ariobarzan Relay Active', { status: 200 });
-            }
-            const webSocketPair = new WebSocketPair();
-            [webSocketPair[0], webSocketPair[1]].forEach((ws) => ws.accept());
-            ctx.waitUntil(handleWebSocket(webSocketPair[1], env.UUID));
-            return new Response(null, {
-                status: 101,
-                webSocket: webSocketPair[0],
-            });
-        } catch (err) {
-            return new Response(err.toString(), { status: 500 });
-        }
-    },
+	async fetch(request, env, ctx) {
+		try {
+			const upgradeHeader = request.headers.get('Upgrade');
+			if (!upgradeHeader || upgradeHeader !== 'websocket') {
+				return new Response('Ariobarzen Worker is Active and Running!', { status: 200 });
+			}
+			return await handleWebSocket(request, env.UUID);
+		} catch (err) {
+			return new Response(err.toString(), { status: 500 });
+		}
+	},
 };
 
-async function handleWebSocket(webSocket, userID) {
-    let remoteSocket = null;
-    let wsClosed = false;
+async function handleWebSocket(request, userID) {
+	const webSocketPair = new WebSocketPair();
+	const [client, server] = Object.values(webSocketPair);
 
-    webSocket.addEventListener('message', async (event) => {
-        if (wsClosed) return;
-        const message = event.data;
-        
-        if (!remoteSocket) {
-            try {
-                const header = processVlessHeader(message, userID);
-                if (!header) {
-                    webSocket.close();
-                    return;
-                }
-                remoteSocket = connect({ hostname: header.address, port: header.port });
-                
-                const writer = remoteSocket.writable.getWriter();
-                await writer.write(header.rest);
-                writer.releaseLock();
+	server.accept();
 
-                // خواندن داده‌ها از ریموت و ارسال به وب‌سوکت
-                remoteSocket.readable.pipeTo(new WritableStream({
-                    write(chunk) {
-                        if (!wsClosed && webSocket.readyState === WebSocket.OPEN) {
-                            webSocket.send(chunk);
-                        }
-                    },
-                    close() {
-                        safeClose();
-                    },
-                    abort(err) {
-                        safeClose();
-                    }
-                })).catch(() => safeClose());
+	let address = '';
+	let port = '';
+	let decodedHeader = false;
+	let tcpSocket = null;
+	let writer = null;
 
-            } catch (e) {
-                safeClose();
-            }
-        } else {
-            try {
-                const writer = remoteSocket.writable.getWriter();
-                await writer.write(message);
-                writer.releaseLock();
-            } catch (e) {
-                safeClose();
-            }
-        }
-    });
+	const logError = (msg) => {
+		// خطاها مدیریت می‌شوند تا ورکر کرش نکند
+	};
 
-    webSocket.addEventListener('close', () => { wsClosed = true; safeClose(); });
-    webSocket.addEventListener('error', () => { wsClosed = true; safeClose(); });
+	server.addEventListener('message', async (event) => {
+		try {
+			const data = event.data;
+			if (!decodedHeader) {
+				const vlessResponse = parseVlessHeader(data, userID);
+				if (!vlessResponse) {
+					server.close();
+					return;
+				}
+				address = vlessResponse.address;
+				port = vlessResponse.port;
+				decodedHeader = true;
 
-    function safeClose() {
-        wsClosed = true;
-        try { remoteSocket?.close(); } catch {}
-        try { webSocket.close(); } catch {}
-    }
+				tcpSocket = connect({ hostname: address, port: port });
+				writer = tcpSocket.writable.getWriter();
+
+				await writer.write(vlessResponse.rawHeaderData);
+
+				// خواندن داده‌ها از شبکه و ارسال به کلاینت
+				ctxStreamToWebSocket(tcpSocket, server, logError);
+			} else {
+				if (writer) {
+					await writer.write(data);
+				}
+			}
+		} catch (err) {
+			logError(err);
+		}
+	});
+
+	server.addEventListener('close', () => {
+		if (tcpSocket) tcpSocket.close();
+	});
+
+	return new Response(null, {
+		status: 101,
+		webSocket: client,
+	});
 }
 
-function processVlessHeader(buffer, userID) {
-    if (buffer.byteLength < 24) return null;
-    const view = new DataView(buffer);
-    
-    // بررسی UUID
-    const uuidBytes = new Uint8Array(buffer, 1, 16);
-    const uuid = bytesToUuid(uuidBytes);
-    if (uuid !== userID) return null;
+function parseVlessHeader(buffer, userID) {
+	const view = new DataView(buffer);
+	if (view.byteLength < 24) return null;
 
-    const optLength = view.getUint8(17);
-    const commandIndex = 18 + optLength;
-    const command = view.getUint8(commandIndex);
-    
-    // فقط دستور TCP (مقدار 1) پشتیبانی می‌شود
-    if (command !== 1) return null;
+	// چک کردن UUID
+	const uuidBytes = new Uint8Array(buffer, 1, 16);
+	const parsedUUID = bytesToUuid(uuidBytes);
+	if (parsedUUID.toLowerCase() !== userID.toLowerCase()) {
+		return null;
+	}
 
-    let portIndex = commandIndex + 1;
-    const port = view.getUint16(portIndex);
-    let addressIndex = portIndex + 2;
-    const addressType = view.getUint8(addressIndex);
-    
-    let addressLength = 0;
-    let address = "";
-    let headerLength = 0;
+	const optLength = view.getUint8(17);
+	const command = view.getUint8(18 + optLength);
+	
+	// فرمان TCP = 1
+	if (command !== 1) return null;
 
-    if (addressType === 1) { // IPv4
-        addressLength = 4;
-        addressIndex += 1;
-        address = new Uint8Array(buffer, addressIndex, 4).join('.');
-        headerLength = addressIndex + 4;
-    } else if (addressType === 2) { // Domain
-        addressLength = view.getUint8(addressIndex + 1);
-        addressIndex += 2;
-        address = new TextDecoder().decode(new Uint8Array(buffer, addressIndex, addressLength));
-        headerLength = addressIndex + addressLength;
-    } else if (addressType === 3) { // IPv6
-        addressLength = 16;
-        addressIndex += 1;
-        const arr = [];
-        for (let i = 0; i < 8; i++) {
-            arr.push(view.getUint16(addressIndex + i * 2).toString(16));
-        }
-        address = arr.join(':');
-        headerLength = addressIndex + 16;
-    } else {
-        return null;
-    }
+	let portIndex = 19 + optLength;
+	const port = view.getUint16(portIndex);
+	const addressType = view.getUint8(portIndex + 2);
 
-    const rest = buffer.slice(headerLength);
-    return { address, port, rest };
+	let addressIndex = portIndex + 3;
+	let address = '';
+
+	if (addressType === 1) { // IPv4
+		address = Array.from(new Uint8Array(buffer, addressIndex, 4)).join('.');
+		addressIndex += 4;
+	} else if (addressType === 2) { // Domain
+		const domainLength = view.getUint8(addressIndex);
+		addressIndex += 1;
+		address = new TextDecoder().decode(new Uint8Array(buffer, addressIndex, domainLength));
+		addressIndex += domainLength;
+	} else if (addressType === 3) { // IPv6
+		const ipv6 = [];
+		for (let i = 0; i < 8; i++) {
+			ipv6.push(view.getUint16(addressIndex + i * 2).toString(16));
+		}
+		address = ipv6.join(':');
+		addressIndex += 16;
+	} else {
+		return null;
+	}
+
+	const rawHeaderData = buffer.slice(addressIndex);
+	return { address, port, rawHeaderData };
 }
 
-function bytesToUuid(bytes) {
-    const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+function bytesToUuid(byteArray) {
+	const hex = Array.from(byteArray, (byte) => ('0' + (byte & 0xff).toString(16)).slice(-2));
+	return [
+		hex.slice(0, 4).join(''),
+		hex.slice(4, 6).join(''),
+		hex.slice(6, 8).join(''),
+		hex.slice(8, 10).join(''),
+		hex.slice(10, 16).join(''),
+	].join('-');
+}
+
+async function ctxStreamToWebSocket(tcpSocket, webSocket, logError) {
+	try {
+		const reader = tcpSocket.readable.getReader();
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			if (value) {
+				webSocket.send(value);
+			}
+		}
+	} catch (error) {
+		logError(error);
+	} finally {
+		try {
+			webSocket.close();
+		} catch (e) {}
+	}
 }
