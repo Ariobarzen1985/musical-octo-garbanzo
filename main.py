@@ -23,6 +23,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 API_TOKEN = os.getenv("API_TOKEN", "8883749489:AAEpaX4_oKE8_7llrJ_TWTBG-r9QeKZVXrA")
 INITIAL_ADMINS = {8443938939}
 
+TON_DONATE_ADDRESS = "UQAQbW_kDwLvTaqnZsM6U8aU46oVA7vEDMbChOwTC719Hv4N"
+
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
 WORKER_SCRIPT_NAME = "ariobarzan-master"
 WORKER_JS_PATH = "worker.js"
@@ -31,26 +33,124 @@ if os.path.exists(WORKER_JS_PATH):
     with open(WORKER_JS_PATH, "r", encoding="utf-8") as f:
         WORKER_JS_SOURCE = f.read()
 else:
-    WORKER_JS_SOURCE = """
+    # نسخه‌ی پیش‌فرض واقعی: پروتکل VLESS را با TCP Sockets کلودفلر
+    # (cloudflare:sockets) کامل پیاده‌سازی می‌کند تا کانفیگ‌ها واقعاً کار کنند.
+    # (قبلاً نسخه‌ی این فایل فقط WebSocket را باز می‌کرد و ترافیک را رد
+    # نمی‌کرد — کانفیگ‌ها وصل می‌شدند ولی هیچ داده‌ای رد و بدل نمی‌شد.)
+    WORKER_JS_SOURCE = """import { connect } from "cloudflare:sockets";
+
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const upgradeHeader = request.headers.get("Upgrade");
-    if (upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
-      return await handleVlessWebSocket(request, env.UUID);
+    const upgrade = request.headers.get("Upgrade");
+    if (upgrade !== "websocket") {
+      return new Response("Ariobarzan relay is running.", { status: 200 });
     }
-    return new Response("Ariobarzan Proxy Active", { status: 200 });
-  }
+
+    const allowedUuid = (env.UUID || "").replace(/-/g, "").toLowerCase();
+    if (!allowedUuid) {
+      return new Response("UUID not configured", { status: 500 });
+    }
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    server.accept();
+
+    let remoteSocket = null;
+
+    server.addEventListener("message", async (event) => {
+      try {
+        const data = event.data;
+        const buf = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(await data.arrayBuffer());
+
+        if (!remoteSocket) {
+          const parsed = parseVlessHeader(buf, allowedUuid);
+          if (!parsed) {
+            server.close(1008, "invalid vless header");
+            return;
+          }
+          remoteSocket = connect({ hostname: parsed.addr, port: parsed.port });
+          const writer = remoteSocket.writable.getWriter();
+          if (parsed.rawClientData.length > 0) {
+            await writer.write(parsed.rawClientData);
+          }
+          writer.releaseLock();
+
+          server.send(new Uint8Array([parsed.version, 0]));
+          pumpRemoteToClient(remoteSocket, server);
+        } else {
+          const writer = remoteSocket.writable.getWriter();
+          await writer.write(buf);
+          writer.releaseLock();
+        }
+      } catch (err) {
+        try { server.close(1011, "relay error"); } catch (_) {}
+      }
+    });
+
+    server.addEventListener("close", () => {
+      try { remoteSocket && remoteSocket.close(); } catch (_) {}
+    });
+
+    return new Response(null, { status: 101, webSocket: client });
+  },
 };
 
-async function handleVlessWebSocket(request, userID) {
-  const webSocketPair = new WebSocketPair();
-  const [client, server] = Object.values(webSocketPair);
-  server.accept();
-  return new Response(null, {
-    status: 101,
-    webSocket: client,
-  });
+function parseVlessHeader(buf, expectedUuidHex) {
+  if (buf.length < 24) return null;
+  const version = buf[0];
+
+  let uuidHex = "";
+  for (let i = 1; i <= 16; i++) uuidHex += buf[i].toString(16).padStart(2, "0");
+  if (uuidHex !== expectedUuidHex) return null;
+
+  let offset = 17;
+  const optLen = buf[offset];
+  offset += 1 + optLen;
+
+  offset += 1;
+  const port = (buf[offset] << 8) + buf[offset + 1];
+  offset += 2;
+
+  const addrType = buf[offset];
+  offset += 1;
+
+  let addr;
+  if (addrType === 1) {
+    addr = buf[offset] + "." + buf[offset + 1] + "." + buf[offset + 2] + "." + buf[offset + 3];
+    offset += 4;
+  } else if (addrType === 2) {
+    const len = buf[offset];
+    offset += 1;
+    addr = new TextDecoder().decode(buf.slice(offset, offset + len));
+    offset += len;
+  } else if (addrType === 3) {
+    const parts = [];
+    for (let i = 0; i < 8; i++) {
+      parts.push(((buf[offset] << 8) + buf[offset + 1]).toString(16));
+      offset += 2;
+    }
+    addr = parts.join(":");
+  } else {
+    return null;
+  }
+
+  const rawClientData = buf.slice(offset);
+  return { version, addr, port, rawClientData };
+}
+
+async function pumpRemoteToClient(remoteSocket, ws) {
+  const reader = remoteSocket.readable.getReader();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      ws.send(value);
+    }
+  } catch (_) {
+  } finally {
+    try { ws.close(); } catch (_) {}
+  }
 }
 """
 
@@ -452,7 +552,7 @@ def build_sub_text(user_uuid: str, worker_host: str) -> str:
         build_configs_for_user(user_uuid, worker_host, "gaming") +
         build_configs_for_user(user_uuid, worker_host, "national")
     )
-    raw = "\n".join(raw_list[:15])
+    raw = "\n".join(raw_list)
     return base64.b64encode(raw.encode("utf-8")).decode("utf-8")
 
 
@@ -550,6 +650,7 @@ def main_menu_kb(user_id: int) -> types.InlineKeyboardMarkup:
         [types.InlineKeyboardButton(text="🔑 دریافت کانفیگ تکی", callback_data="get_single_config")],
         [types.InlineKeyboardButton(text="📖 راهنمای جامع استفاده", callback_data="user_guide")],
         [types.InlineKeyboardButton(text="💬 ارتباط با پشتیبانی", callback_data="support_user")],
+        [types.InlineKeyboardButton(text="💎 حمایت از سازنده (TON)", callback_data="support_creator")],
         [types.InlineKeyboardButton(text="🔄 شروع مجدد ربات", callback_data="restart_bot")],
     ]
     if is_admin(user_id):
@@ -591,6 +692,15 @@ async def send_welcome(message: types.Message):
     )
 
 
+@dp.message(Command("panel"))
+async def open_panel_cmd(message: types.Message):
+    # همان دکمه‌ی «☰ Menu» کنار کادر پیام؛ برای کاربر عادی پنل کاربری و
+    # برای ادمین (چون در main_menu_kb دکمه‌ی پنل مدیریت هم اضافه می‌شود)
+    # هر دو پنل را در یک منو نشان می‌دهد.
+    upsert_user(message.from_user.id, username=message.from_user.username)
+    await message.answer("🎛 **پنل شما**", reply_markup=main_menu_kb(message.from_user.id), parse_mode="Markdown")
+
+
 @dp.callback_query(F.data == "restart_bot")
 async def restart_bot_cb(callback: types.CallbackQuery):
     await callback.message.edit_text("🔄 ربات با موفقیت ری‌استارت شد.", reply_markup=main_menu_kb(callback.from_user.id))
@@ -606,12 +716,74 @@ async def back_main_cb(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "user_guide")
 async def user_guide_cb(callback: types.CallbackQuery):
     guide_text = (
-        "📖 **راهنمای جامع استفاده از ربات آریوبرزن**\n\n"
-        "۱. توکن کلودفلر خود را از بخش «اتصال خودکار با توکن کلودفلر» ارسال کنید.\n"
-        "۲. لینک ساب‌اسکریپت خود را در V2Box، V2RayNG یا سایر کلاینت‌ها وارد کنید.\n"
-        "۳. از کانفیگ‌های اختصاصی گیم، نت ملی و معمولی لذت ببرید."
+        "📖 **راهنمای جامع ربات آریوبرزن**\n\n"
+        "این ربات به شما کمک می‌کند با استفاده از اکانت رایگان کلودفلر خودتان، "
+        "یک سرور اختصاصی (Worker) بسازید که نقش پروکسی VLESS را بازی می‌کند. "
+        "یعنی سرعت و پایداری اتصال شما به زیرساخت جهانی و رایگان کلودفلر وابسته "
+        "است، نه یک VPS معمولی که ممکن است فیلتر یا کند شود.\n\n"
+
+        "**۱) نوع اتصال — چطور کار می‌کند؟**\n"
+        "وقتی توکن API کلودفلر خودتان را از بخش «اتصال خودکار با توکن کلودفلر» "
+        "ارسال می‌کنید، ربات به‌صورت کاملاً خودکار:\n"
+        "  • اکانت کلودفلر شما را با همان توکن شناسایی می‌کند (نیازی به فرستادن "
+        "چیز دیگری مثل Account ID نیست)،\n"
+        "  • یک Worker اختصاصی روی حساب خودِ شما دیپلوی می‌کند،\n"
+        "  • یک UUID یکتا برای شما می‌سازد و در همان Worker ثبت می‌کند،\n"
+        "  • زیردامنه‌ی رایگان workers.dev را برایتان فعال می‌کند.\n"
+        "از این لحظه، Worker شما به‌عنوان سرور VLESS کار می‌کند و کانفیگ‌هایی که "
+        "ربات می‌سازد مستقیماً به همان Worker وصل می‌شوند.\n\n"
+
+        "**۲) توکن کلودفلر خودم امنه؟**\n"
+        "توکن فقط برای دیپلوی‌کردن Worker روی حساب خودتان استفاده می‌شود؛ به "
+        "دامنه‌ها یا اطلاعات دیگر حساب شما دسترسی داده نمی‌شود مگر همان دسترسی "
+        "محدودی که هنگام ساخت توکن (Workers Scripts:Edit) به آن داده‌اید.\n\n"
+
+        "**۳) انواع کانفیگ چه فرقی دارند؟**\n"
+        "  🎮 **گیم (Low-Ping):** برای بازی‌های آنلاین بهینه شده؛ مسیر و تنظیمات "
+        "طوری انتخاب شده که تأخیر (پینگ) تا حد ممکن کم بماند.\n"
+        "  🛡 **نت ملی / شرایط اضطراری (Anti-Block):** برای زمانی که اینترنت "
+        "بین‌الملل محدود یا مسدود شده و فقط دسترسی به نت داخلی/محدود دارید؛ "
+        "این پروفایل تلاش می‌کند حتی در این شرایط اتصال برقرار بماند.\n"
+        "  ⚡ **عمومی (High-Speed):** برای استفاده‌ی روزمره با بیشترین سرعت "
+        "ممکن، مناسب مرور وب، دانلود و استریم.\n"
+        "هر سه نوع را می‌توانید از «ساخت کانفیگ تخصصی» بسازید، یا همه را یک‌جا "
+        "از «دریافت لینک ساب‌اسکریپت» به‌صورت یک لینک واحد دریافت کنید.\n\n"
+
+        "**۴) لینک ساب‌اسکریپت را کجا وارد کنم؟**\n"
+        "لینکی که از «دریافت لینک ساب‌اسکریپت» می‌گیرید را در برنامه‌هایی مثل "
+        "**V2Box**، **V2RayNG**، **Streisand** یا هر کلاینت دیگری که از VLESS و "
+        "«Subscription» پشتیبانی می‌کند وارد کنید و به‌روزرسانی (Update) بزنید. "
+        "این لینک ثابت است و همیشه آخرین کانفیگ‌های سالم را برمی‌گرداند، چون "
+        "ربات به‌صورت خودکار وضعیت IP ها را بررسی و در صورت نیاز جایگزین "
+        "می‌کند.\n\n"
+
+        "**۵) مشکلی پیش اومد چیکار کنم؟**\n"
+        "از بخش «ارتباط با پشتیبانی» پیام بدید تا در سریع‌ترین زمان بررسی بشه.\n\n"
+
+        "**۶) حمایت از سازنده**\n"
+        "این ربات رایگان و بدون تبلیغات در اختیار شما قرار گرفته. اگر دوست "
+        "دارید از توسعه و نگه‌داری‌اش حمایت کنید، از دکمه‌ی «💎 حمایت از سازنده "
+        "(TON)» در منوی اصلی استفاده کنید؛ آدرس ولت به‌صورت متن قابل‌کپی نمایش "
+        "داده می‌شود و کاملاً اختیاری است."
     )
     await callback.message.answer(guide_text, reply_markup=back_to_main_kb(), parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "support_creator")
+async def support_creator_cb(callback: types.CallbackQuery):
+    text = (
+        "💎 **حمایت از سازنده**\n\n"
+        "از این‌که وقت گذاشتید و تا اینجا با ما همراه بودید سپاسگزاریم 🙏\n"
+        "این ربات با علاقه و بدون چشم‌داشت برای شما ساخته و نگه‌داری می‌شود. "
+        "اگر این ابزار براتون مفید بوده و دوست دارید از ادامه‌ی توسعه و "
+        "نگه‌داری‌اش حمایت کنید، می‌تونید با هر مبلغی (تتر روی شبکه TON) "
+        "به آدرس زیر واریز کنید. هر کمکی، هرچند کوچک، با قدردانی پذیرفته می‌شه ❤️\n\n"
+        "آدرس ولت TON:\n"
+        f"`{TON_DONATE_ADDRESS}`\n\n"
+        "برای کپی کردن، فقط روی آدرس بالا بزنید."
+    )
+    await callback.message.answer(text, reply_markup=back_to_main_kb(), parse_mode="Markdown")
     await callback.answer()
 
 
@@ -686,7 +858,7 @@ async def make_custom_config_cb(callback: types.CallbackQuery):
 
     configs = build_configs_for_user(user["config_uuid"], user["worker_host"], profile)
     text = (
-        f"✅ **کانفیگ‌های پروفایل ({profile.upper}) آماده شد!**\n\n"
+        f"✅ **کانفیگ‌های پروفایل ({profile.upper()}) آماده شد!**\n\n"
         f"نمونه کانفیگ:\n`{configs[0]}`\n\n"
         f"برای دریافت لیست کامل ۱۵ عددی کلاینت، از دکمه «دریافت لینک ساب‌اسکریپت» استفاده کنید."
     )
@@ -1002,6 +1174,18 @@ async def run_web_app():
 # ============================================================
 async def main():
     init_db()
+    try:
+        # ثبت دستور /panel روی همون دکمه‌ی منوی کنار کادر پیام تلگرام
+        # (نزدیک‌ترین معادل رسمی به «۴ خونه» که خودِ اپ تلگرام در اختیار می‌ذاره؛
+        # چون تلگرام امکان رنگی‌کردن یا آیکون سفارشی برای این دکمه رو نمی‌ده)
+        await bot.set_my_commands([
+            types.BotCommand(command="start", description="🚀 شروع ربات"),
+            types.BotCommand(command="panel", description="🎛 پنل کاربری و مدیریت"),
+        ])
+        await bot.set_chat_menu_button(menu_button=types.MenuButtonCommands())
+    except Exception as e:
+        logging.error(f"set commands/menu error: {e}")
+
     asyncio.create_task(run_web_app())
     asyncio.create_task(health_check_loop())
     await dp.start_polling(bot)
